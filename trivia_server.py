@@ -20,7 +20,108 @@ logger = logging.getLogger("trivia-server")
 # Initialize MCP server
 mcp = FastMCP("trivia")
 
+# === FILTERING CONSTANTS ===
+
+# Entertainment occupations to include
+ENTERTAINMENT_KEYWORDS = [
+    "actor", "actress", "singer", "musician", "rapper", "comedian", "director",
+    "producer", "screenwriter", "filmmaker", "entertainer", "television host",
+    "tv host", "talk show", "radio host", "model", "supermodel", "dancer",
+    "choreographer", "composer", "songwriter", "rock", "pop", "country",
+    "hip hop", "r&b", "jazz", "band", "youtube", "influencer", "tiktoker",
+    "podcaster", "voice actor", "stand-up", "snl", "saturday night live"
+]
+
+# Political/leadership occupations
+POLITICS_KEYWORDS = [
+    "president", "prime minister", "senator", "congressman", "governor",
+    "mayor", "politician", "political", "secretary of state", "ambassador",
+    "supreme court", "justice", "attorney general", "minister", "chancellor",
+    "monarch", "king", "queen", "prince", "princess", "first lady"
+]
+
+# Science/innovation occupations
+SCIENCE_KEYWORDS = [
+    "scientist", "physicist", "chemist", "biologist", "astronaut", "nasa",
+    "inventor", "engineer", "mathematician", "nobel prize", "researcher",
+    "professor", "doctor", "surgeon", "psychologist", "economist",
+    "astronomer", "cosmologist", "geneticist", "neuroscientist"
+]
+
+# Sports (major Western sports figures)
+SPORTS_KEYWORDS = [
+    "football player", "nfl", "quarterback", "basketball player", "nba",
+    "baseball player", "mlb", "hockey player", "nhl", "soccer player",
+    "tennis player", "golfer", "boxer", "wrestler", "wwe", "olympic",
+    "athlete", "coach", "mvp", "hall of fame", "super bowl", "world series"
+]
+
+# Western countries/nationalities to prioritize
+WESTERN_INDICATORS = [
+    "american", "british", "english", "canadian", "australian", "irish",
+    "scottish", "welsh", "new zealand", "german", "french", "italian",
+    "spanish", "dutch", "swedish", "norwegian", "danish", "belgian",
+    "austrian", "swiss", "polish", "greek", "portuguese",
+    "united states", "united kingdom", "hollywood", "broadway", "grammy",
+    "oscar", "emmy", "tony award", "bafta", "golden globe"
+]
+
+# Combine all relevant keywords
+ALL_NOTABLE_KEYWORDS = (
+    ENTERTAINMENT_KEYWORDS + POLITICS_KEYWORDS + 
+    SCIENCE_KEYWORDS + SPORTS_KEYWORDS
+)
+
+
 # === UTILITY FUNCTIONS ===
+
+def is_western_notable(text: str, pages: list = None) -> tuple:
+    """Check if a person is a Western notable figure. Returns (is_notable, category, score)."""
+    text_lower = text.lower()
+    score = 0
+    category = "other"
+    
+    # Check for Western indicators
+    western_match = any(indicator in text_lower for indicator in WESTERN_INDICATORS)
+    if western_match:
+        score += 2
+    
+    # Check entertainment
+    if any(kw in text_lower for kw in ENTERTAINMENT_KEYWORDS):
+        score += 3
+        category = "entertainment"
+    
+    # Check politics
+    elif any(kw in text_lower for kw in POLITICS_KEYWORDS):
+        score += 3
+        category = "politics"
+    
+    # Check science
+    elif any(kw in text_lower for kw in SCIENCE_KEYWORDS):
+        score += 3
+        category = "science"
+    
+    # Check sports
+    elif any(kw in text_lower for kw in SPORTS_KEYWORDS):
+        score += 2
+        category = "sports"
+    
+    # Check Wikipedia pages for additional context
+    if pages:
+        for page in pages:
+            page_desc = page.get("description", "").lower()
+            page_title = page.get("title", "").lower()
+            combined = f"{page_desc} {page_title}"
+            
+            if any(kw in combined for kw in ALL_NOTABLE_KEYWORDS):
+                score += 2
+            if any(indicator in combined for indicator in WESTERN_INDICATORS):
+                score += 1
+    
+    # Must have minimum score to be considered notable
+    is_notable = score >= 3
+    return is_notable, category, score
+
 
 async def duckduckgo_search(query: str, max_results: int = 5) -> list:
     """Search DuckDuckGo and return results."""
@@ -88,9 +189,10 @@ async def wikipedia_summary(title: str) -> str:
     return "Could not fetch summary."
 
 
-async def fetch_on_this_day(month: int, day: int) -> dict:
-    """Fetch On This Day data from Wikipedia API."""
+async def fetch_on_this_day_filtered(month: int, day: int) -> dict:
+    """Fetch On This Day data filtered for Western notable figures."""
     events = {"events": [], "births": [], "deaths": []}
+    
     try:
         url = f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/all/{month:02d}/{day:02d}"
         headers = {"User-Agent": "TriviaMCPServer/1.0"}
@@ -98,21 +200,105 @@ async def fetch_on_this_day(month: int, day: int) -> dict:
             response = await client.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             data = response.json()
-            for event in data.get("events", [])[:10]:
+            
+            # Process events - filter for Western-relevant events
+            for event in data.get("events", []):
                 year = event.get("year", "")
                 text = event.get("text", "")
-                events["events"].append(f"{year}: {text}")
-            for birth in data.get("births", [])[:10]:
+                pages = event.get("pages", [])
+                
+                # Check if event is Western-relevant
+                combined_text = f"{text} " + " ".join([p.get("description", "") for p in pages])
+                if any(indicator in combined_text.lower() for indicator in WESTERN_INDICATORS):
+                    events["events"].append({
+                        "year": year,
+                        "text": text,
+                        "score": 5
+                    })
+                elif any(kw in combined_text.lower() for kw in ALL_NOTABLE_KEYWORDS):
+                    events["events"].append({
+                        "year": year,
+                        "text": text,
+                        "score": 3
+                    })
+            
+            # Sort events by score and take top entries
+            events["events"] = sorted(events["events"], key=lambda x: x["score"], reverse=True)[:10]
+            events["events"] = [f"{e['year']}: {e['text']}" for e in events["events"]]
+            
+            # Process births - filter for Western celebrities and notable figures
+            scored_births = []
+            for birth in data.get("births", []):
                 year = birth.get("year", "")
                 text = birth.get("text", "")
-                events["births"].append(f"{year}: {text}")
-            for death in data.get("deaths", [])[:5]:
+                pages = birth.get("pages", [])
+                
+                is_notable, category, score = is_western_notable(text, pages)
+                
+                if is_notable:
+                    scored_births.append({
+                        "year": year,
+                        "text": text,
+                        "category": category,
+                        "score": score
+                    })
+            
+            # Sort by score and take top births
+            scored_births = sorted(scored_births, key=lambda x: x["score"], reverse=True)[:12]
+            events["births"] = [
+                f"{b['year']}: {b['text']} [{b['category'].upper()}]" 
+                for b in scored_births
+            ]
+            
+            # Process deaths - filter similarly
+            scored_deaths = []
+            for death in data.get("deaths", []):
                 year = death.get("year", "")
                 text = death.get("text", "")
-                events["deaths"].append(f"{year}: {text}")
+                pages = death.get("pages", [])
+                
+                is_notable, category, score = is_western_notable(text, pages)
+                
+                if is_notable:
+                    scored_deaths.append({
+                        "year": year,
+                        "text": text,
+                        "category": category,
+                        "score": score
+                    })
+            
+            scored_deaths = sorted(scored_deaths, key=lambda x: x["score"], reverse=True)[:6]
+            events["deaths"] = [
+                f"{d['year']}: {d['text']} [{d['category'].upper()}]" 
+                for d in scored_deaths
+            ]
+            
     except Exception as e:
         logger.error(f"On This Day fetch error: {e}")
+    
     return events
+
+
+async def search_celebrity_birthdays(month: int, day: int) -> list:
+    """Search for celebrity birthdays on a specific date."""
+    celebrities = []
+    month_names = ["", "January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December"]
+    date_str = f"{month_names[month]} {day}"
+    
+    # Search for celebrity birthdays
+    queries = [
+        f"famous celebrity birthdays {date_str}",
+        f"actors actresses born {date_str}",
+        f"famous people born {date_str} actors singers"
+    ]
+    
+    for query in queries:
+        results = await duckduckgo_search(query, max_results=5)
+        for r in results:
+            celebrities.append(f"{r['title']}: {r['snippet'][:150]}" if r['snippet'] else r['title'])
+    
+    return celebrities[:8]
 
 
 async def fetch_url_content(url: str, max_chars: int = 5000) -> str:
@@ -201,41 +387,57 @@ async def trivia_for_today(date_override: str = "") -> str:
             today = datetime.now()
             month, day = today.month, today.day
         
-        output = [f"📅 TRIVIA FOR {month:02d}/{day:02d}", "=" * 50, ""]
+        month_names = ["", "January", "February", "March", "April", "May", "June",
+                       "July", "August", "September", "October", "November", "December"]
         
-        # On This Day from Wikipedia
-        otd_data = await fetch_on_this_day(month, day)
+        output = [
+            f"📅 TRIVIA FOR {month_names[month].upper()} {day}",
+            "=" * 50,
+            "Filtered for Western celebrities, entertainment, politics & science",
+            ""
+        ]
+        
+        # Get filtered On This Day data
+        otd_data = await fetch_on_this_day_filtered(month, day)
+        
+        if otd_data["births"]:
+            output.append("🎂 CELEBRITY & NOTABLE BIRTHDAYS:")
+            output.append("-" * 30)
+            for birth in otd_data["births"]:
+                output.append(f"• {birth}")
+            output.append("")
         
         if otd_data["events"]:
-            output.append("🏛️ HISTORICAL EVENTS:")
+            output.append("🏛️ MAJOR HISTORICAL EVENTS:")
             output.append("-" * 30)
             for event in otd_data["events"][:8]:
                 output.append(f"• {event}")
             output.append("")
         
-        if otd_data["births"]:
-            output.append("🎂 FAMOUS BIRTHDAYS:")
-            output.append("-" * 30)
-            for birth in otd_data["births"][:8]:
-                output.append(f"• {birth}")
-            output.append("")
-        
         if otd_data["deaths"]:
             output.append("🕯️ NOTABLE DEATHS:")
             output.append("-" * 30)
-            for death in otd_data["deaths"][:5]:
+            for death in otd_data["deaths"]:
                 output.append(f"• {death}")
             output.append("")
         
-        # Search for entertainment releases on this date
-        month_names = ["", "January", "February", "March", "April", "May", "June",
-                       "July", "August", "September", "October", "November", "December"]
-        date_str = f"{month_names[month]} {day}"
+        # Supplementary celebrity birthday search
+        output.append("🌟 ADDITIONAL CELEBRITY BIRTHDAYS (Web Search):")
+        output.append("-" * 30)
+        celeb_results = await search_celebrity_birthdays(month, day)
+        for celeb in celeb_results:
+            output.append(f"• {celeb}")
         
+        output.append("")
+        
+        # Entertainment releases search
+        date_str = f"{month_names[month]} {day}"
         output.append("🎬 ENTERTAINMENT ON THIS DATE:")
         output.append("-" * 30)
         
-        entertainment_results = await duckduckgo_search(f"movies released {date_str} history", max_results=4)
+        entertainment_results = await duckduckgo_search(
+            f"movies released {date_str} history famous films", max_results=4
+        )
         for result in entertainment_results:
             output.append(f"• {result['title']}")
             if result['snippet']:
@@ -268,42 +470,43 @@ async def trivia_for_week(start_date: str = "") -> str:
             start = datetime.now()
             start = start - timedelta(days=start.weekday())
         
-        output = [f"📆 WEEKLY TRIVIA: Week of {start.strftime('%B %d, %Y')}", "=" * 50, ""]
-        
-        month_names = ["", "January", "February", "March", "April", "May", "June",
-                       "July", "August", "September", "October", "November", "December"]
+        output = [
+            f"📆 WEEKLY TRIVIA: Week of {start.strftime('%B %d, %Y')}",
+            "=" * 50,
+            "Filtered for Western celebrities, entertainment, politics & science",
+            ""
+        ]
         
         # Collect highlights for each day of the week
-        weekly_events = []
         weekly_births = []
+        weekly_events = []
         
         for i in range(7):
             current = start + timedelta(days=i)
-            day_name = current.strftime("%A")
-            date_display = current.strftime("%m/%d")
+            date_display = current.strftime("%m/%d (%a)")
             
-            otd_data = await fetch_on_this_day(current.month, current.day)
+            otd_data = await fetch_on_this_day_filtered(current.month, current.day)
             
-            if otd_data["events"]:
-                for event in otd_data["events"][:2]:
-                    weekly_events.append(f"[{date_display}] {event}")
+            # Get top 2 births per day
+            for birth in otd_data["births"][:2]:
+                weekly_births.append(f"[{date_display}] {birth}")
             
-            if otd_data["births"]:
-                for birth in otd_data["births"][:2]:
-                    weekly_births.append(f"[{date_display}] {birth}")
-        
-        if weekly_events:
-            output.append("🏛️ KEY HISTORICAL EVENTS THIS WEEK:")
-            output.append("-" * 30)
-            for event in weekly_events[:14]:
-                output.append(f"• {event}")
-            output.append("")
+            # Get top 1 event per day
+            for event in otd_data["events"][:1]:
+                weekly_events.append(f"[{date_display}] {event}")
         
         if weekly_births:
             output.append("🎂 CELEBRITY BIRTHDAYS THIS WEEK:")
             output.append("-" * 30)
-            for birth in weekly_births[:14]:
+            for birth in weekly_births:
                 output.append(f"• {birth}")
+            output.append("")
+        
+        if weekly_events:
+            output.append("🏛️ KEY HISTORICAL EVENTS THIS WEEK:")
+            output.append("-" * 30)
+            for event in weekly_events:
+                output.append(f"• {event}")
             output.append("")
         
         # Entertainment news for the week
@@ -445,7 +648,7 @@ async def search_sports_trivia(sport: str = "", query: str = "") -> str:
             searches = [f"{query} MLB baseball trivia", f"{query} World Series"]
         elif sport_type in ["nhl", "hockey"]:
             searches = [f"{query} NHL hockey trivia", f"{query} Stanley Cup"]
-        elif sport_type in ["soccer", "football", "mls", "premier"]:
+        elif sport_type in ["soccer", "mls", "premier"]:
             searches = [f"{query} soccer football trivia", f"{query} World Cup"]
         elif sport_type in ["olympics", "olympic"]:
             searches = [f"{query} Olympic trivia", f"{query} Olympic medal history"]
